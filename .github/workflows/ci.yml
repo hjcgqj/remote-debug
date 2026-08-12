@@ -1,0 +1,129 @@
+name: CI Build (push-to-main)
+
+# 每次推代码到 main，自动三平台编译，产物上传到 Artifacts 可直接下载（保留 90 天）
+# 不需要打 tag，不用点发布 —— 你 commit 完 push 就完事。
+#
+# 触发方式：
+#   1. git push origin main
+#   2. 到仓库 Actions 页 → 点对应运行 → 下载 Artifacts 里的 6 个文件
+#
+# Linux 依然用 centos:7 容器保证 glibc 2.17 兼容性。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+            artifact: windows
+          - os: macos-12
+            target: macos
+            artifact: macos
+          - os: ubuntu-latest
+            target: linux
+            artifact: linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: (non-Linux) Setup Python 3.10
+        if: matrix.target != 'linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: (Linux) Build in centos:7 (glibc 2.17)
+        if: matrix.target == 'linux'
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace:rw" \
+            -w /workspace \
+            centos:7 \
+            /bin/bash -c '
+              set -euxo pipefail
+              yum groupinstall -y "Development Tools" >/dev/null
+              yum install -y zlib-devel bzip2 bzip2-devel readline-devel sqlite \
+                             sqlite-devel openssl-devel xz xz-devel libffi-devel \
+                             tar gzip make gcc-c++ wget perl-core >/dev/null
+              cd /tmp
+              wget -q https://www.python.org/ftp/python/3.10.14/Python-3.10.14.tgz
+              tar xf Python-3.10.14.tgz
+              cd Python-3.10.14
+              ./configure --prefix=/usr/local --enable-shared \
+                LDFLAGS="-Wl,-rpath,/usr/local/lib" >/dev/null
+              make -j"$(nproc)" >/dev/null 2>&1
+              make install >/dev/null 2>&1
+              ldconfig
+              cd /workspace
+              /usr/local/bin/python3.10 -m pip install --upgrade pip >/dev/null
+              /usr/local/bin/python3.10 -m pip install --no-cache-dir \
+                -r server/requirements.txt -r client/requirements.txt \
+                "pyinstaller>=6.0" >/dev/null
+              /usr/local/bin/python3.10 build.py
+            '
+
+      - name: (Windows/macOS) Build
+        if: matrix.target != 'linux'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install -r server/requirements.txt \
+            -r client/requirements.txt "pyinstaller>=6.0" >/dev/null
+          python build.py
+
+      - name: Add platform suffix to binaries
+        shell: bash
+        run: |
+          mkdir -p pkg
+          SUFFIX=${{ matrix.artifact }}
+          for f in dist/remote-debug-server* dist/remote-debug*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            if echo "$name" | grep -q '\.'; then
+              base="${name%.*}"; ext="${name##*.}"
+              cp "$f" "pkg/${base}-${SUFFIX}.${ext}"
+            else
+              cp "$f" "pkg/${name}-${SUFFIX}"
+            fi
+            chmod +x "pkg/$(basename pkg/*)" 2>/dev/null || true
+          done
+          ls -la pkg/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-debug-${{ matrix.artifact }}
+          path: pkg/*
+          retention-days: 90
+
+  # 汇总 Artifacts：运行结束后在一个 Artifact 里拿到 6 个文件，不用分别下
+  summarize:
+    name: combined zip
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: combined
+      - run: |
+          mkdir -p final
+          cp combined/*/* final/ 2>/dev/null || true
+          (cd final && zip -9 ../remote-debug-all-platforms.zip *)
+          ls -la final/ || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-debug-all-platforms
+          path: remote-debug-all-platforms.zip
+          retention-days: 90
