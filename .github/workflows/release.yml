@@ -1,0 +1,139 @@
+name: Release Build
+
+# 三平台云编译：推 tag vX.Y.Z 自动触发，打 Release 发布产物
+#
+# 关键兼容性决策：
+#   Linux 打包在 centos:7 容器里完成（glibc 2.17 / manylinux2014），
+#   生成的 PyInstaller 单文件二进制可以在 CentOS 7+/Ubuntu 18.04+/
+#   Debian 10+/RHEL 7+ 等几乎所有现役 x86_64 Linux 上直接运行，
+#   不会出现 `GLIBC_2.xx not found`。
+#
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:   # 允许手动触发，便于未打 tag 时调试
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Windows ----
+          - os: windows-latest
+            target: windows
+            artifact: windows
+          # ---- macOS (兼容 macOS 10.15+) ----
+          - os: macos-12
+            target: macos
+            artifact: macos
+          # ---- Linux（glibc 2.17 低版本兼容）----
+          - os: ubuntu-latest
+            target: linux
+            artifact: linux
+            use_manylinux: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 非 Linux：直接用 runner 自带 Python
+      - name: (non-Linux) Setup Python 3.10
+        if: matrix.target != 'linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # Linux：在 centos:7（glibc 2.17）容器内完成完整构建
+      - name: (Linux) Build inside centos:7 manylinux container
+        if: matrix.target == 'linux'
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace:rw" \
+            -w /workspace \
+            centos:7 \
+            /bin/bash -c '
+              set -euxo pipefail
+
+              # centos7 自带 Python 2.7，需要从源装 Python 3.10
+              # 用 IUS 社区源提供的 python310 + pip
+              yum install -y centos-release-scl-rh || true
+              yum install -y https://repo.ius.io/ius-release-el7.rpm || \
+                yum install -y https://repo.ius.io/7/x86_64/packages/i/ius-release-1.0-16.ius.el7.noarch.rpm || true
+
+              # 兜底：从源码编译 Python 3.10（最可靠，IUS 偶发断源）
+              if ! command -v python3.10 >/dev/null 2>&1; then
+                yum groupinstall -y "Development Tools"
+                yum install -y zlib-devel bzip2 bzip2-devel readline-devel sqlite \
+                               sqlite-devel openssl-devel xz xz-devel libffi-devel \
+                               tar gzip make gcc-c++ wget
+                cd /tmp
+                wget -q https://www.python.org/ftp/python/3.10.14/Python-3.10.14.tgz
+                tar xf Python-3.10.14.tgz
+                cd Python-3.10.14
+                ./configure --prefix=/usr/local --enable-shared --enable-optimizations=no \
+                  LDFLAGS="-Wl,-rpath,/usr/local/lib"
+                make -j"$(nproc)" >/dev/null
+                make install >/dev/null
+                ln -sf /usr/local/bin/python3.10 /usr/local/bin/python3
+                ldconfig
+              fi
+
+              # 进入工作目录，安装依赖 + 打包
+              cd /workspace
+              /usr/local/bin/python3.10 -m pip install --upgrade pip
+              /usr/local/bin/python3.10 -m pip install -r server/requirements.txt \
+                -r client/requirements.txt "pyinstaller>=6.0"
+              /usr/local/bin/python3.10 build.py
+            '
+
+      # Windows / macOS：直接在 runner 上跑 build.py
+      - name: (Windows/macOS) Install deps and build
+        if: matrix.target != 'linux'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r server/requirements.txt \
+            -r client/requirements.txt "pyinstaller>=6.0"
+          python build.py
+
+      # 产物归档（上传到 Actions artifacts，方便手动下载）
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-debug-${{ matrix.artifact }}
+          path: |
+            dist/remote-debug-server*
+            dist/remote-debug*
+
+      # 准备 Release 上传（重命名为带平台后缀的文件名）
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          SUFFIX=${{ matrix.artifact }}
+          for f in dist/remote-debug-server* dist/remote-debug*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            # 插入平台后缀：remote-debug-server -> remote-debug-server-linux
+            if echo "$name" | grep -q '\.'; then
+              # 有后缀（如 .exe）：remote-debug-server.exe -> remote-debug-server-windows.exe
+              base="${name%.*}"
+              ext="${name##*.}"
+              cp "$f" "release_assets/${base}-${SUFFIX}.${ext}"
+            else
+              cp "$f" "release_assets/${name}-${SUFFIX}"
+            fi
+          done
+          ls -la release_assets/
+
+      # 打 Release 并上传所有产物
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
